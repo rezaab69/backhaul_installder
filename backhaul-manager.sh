@@ -323,17 +323,18 @@ uninstall_backhaul() {
 
 # ─── Tunnel Creation ─────────────────────────────────────────
 pick_transport() {
-    echo ""
-    echo -e "  ${BOLD}Select Transport Protocol:${NC}"
-    echo ""
-    echo -e "  ${CYAN}1)${NC} tcp      - Standard TCP (fastest, simple)"
-    echo -e "  ${CYAN}2)${NC} tcpmux   - TCP with multiplexing (efficient, multi-session)"
-    echo -e "  ${CYAN}3)${NC} udp      - UDP tunneling"
-    echo -e "  ${CYAN}4)${NC} ws       - WebSocket (bypasses HTTP proxies/firewalls)"
-    echo -e "  ${CYAN}5)${NC} wss      - Secure WebSocket with TLS"
-    echo -e "  ${CYAN}6)${NC} wsmux    - WebSocket with multiplexing"
-    echo -e "  ${CYAN}7)${NC} wssmux   - Secure WebSocket with TLS + multiplexing"
-    echo ""
+    echo "" >&2
+    echo -e "  ${BOLD}Select Transport Protocol:${NC}" >&2
+    echo "" >&2
+    echo -e "  ${CYAN}1)${NC} tcp      - Standard TCP (fastest, simple)" >&2
+    echo -e "  ${CYAN}2)${NC} tcpmux   - TCP with multiplexing (efficient, multi-session)" >&2
+    echo -e "  ${CYAN}3)${NC} udp      - UDP tunneling" >&2
+    echo -e "  ${CYAN}4)${NC} ws       - WebSocket (bypasses HTTP proxies/firewalls)" >&2
+    echo -e "  ${CYAN}5)${NC} wss      - Secure WebSocket with TLS" >&2
+    echo -e "  ${CYAN}6)${NC} wsmux    - WebSocket with multiplexing" >&2
+    echo -e "  ${CYAN}7)${NC} wssmux   - Secure WebSocket with TLS + multiplexing" >&2
+    echo "" >&2
+    local choice
     read -rp "$(echo -e "${YELLOW}  Choice [1-7]: ${NC}")" choice
     case "$choice" in
         1) echo "tcp" ;;
