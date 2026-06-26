@@ -4,8 +4,11 @@
 
 # Download and run
 chmod +x backhaul-manager.sh
+
 sudo ./backhaul-manager.sh
 
 # Or with direct commands:
+
 sudo ./backhaul-manager.sh install
+
 sudo ./backhaul-manager.sh diag
