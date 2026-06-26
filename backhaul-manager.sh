@@ -1,1160 +1,1104 @@
 #!/usr/bin/env bash
-# ============================================================
-#  Backhaul Reverse Tunnel Manager
-#  Supports: Debian / Ubuntu (systemd-based)
-#  GitHub  : https://github.com/Musixal/Backhaul
-# ============================================================
+# ============================================================================
+#  Backhaul Manager & Installer
+#  ----------------------------------------------------------------------------
+#  A powerful, full-featured menu-driven installer/manager for the
+#  Musixal/Backhaul reverse-tunneling tool on systemd-based Linux systems
+#  (Debian, Ubuntu and derivatives).
+#
+#  * Installs the official `backhaul` binary for amd64 / arm64
+#  * Lets you create any number of server- or client-side tunnels, each as
+#    its own systemd service and TOML config
+#  * Supports every transport: tcp, tcpmux, ws, wss, wsmux, wssmux, udp
+#  * Generates self-signed TLS certificates for WSS / WSSMUX
+#  * Provides bulk start/stop/restart, live status table, live log tail,
+#    config edit, import / export, backup, update, uninstall, and more.
+#  ----------------------------------------------------------------------------
+#  Usage :  sudo bash backhaul-manager.sh
+#  Author:  Reza (opencode) — built around github.com/Musixal/Backhaul
+#  Version: 1.0.0
+# ============================================================================
 
-set -euo pipefail
+set -Eeuo pipefail
+shopt -s nocasematch
 
-# ─── Constants ───────────────────────────────────────────────
-INSTALL_DIR="/usr/local/bin"
-CONFIG_DIR="/etc/backhaul"
-SERVICE_PREFIX="backhaul"
-LOG_DIR="/var/log/backhaul"
-BINARY_NAME="backhaul"
-BINARY_PATH="${INSTALL_DIR}/${BINARY_NAME}"
-GITHUB_API="https://api.github.com/repos/Musixal/Backhaul/releases/latest"
-GITHUB_RELEASES="https://github.com/Musixal/Backhaul/releases"
+# ----------------------------------------------------------------------------
+#  Globals
+# ----------------------------------------------------------------------------
+readonly SCRIPT_VERSION="1.0.0"
+readonly GITHUB_REPO="Musixal/Backhaul"
+readonly DEFAULT_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+readonly INSTALL_DIR="/opt/backhaul"
+readonly CONF_DIR="/etc/backhaul"
+readonly BIN_PATH="/usr/local/bin/backhaul"
+readonly SVC_DIR="/etc/systemd/system"
+readonly BACKUP_DIR="/var/backhaul-backups"
 
-# ─── Colors ──────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-WHITE='\033[1;37m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m' # No Color
+# Colors / styling (auto-disabled when not a TTY or NO_COLOR is set)
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'; C_MAGENTA=$'\033[35m'; C_CYAN=$'\033[36m'
+    C_GREY=$'\033[90m'
+else
+    C_RESET=""; C_BOLD=""; C_DIM=""
+    C_RED=""; C_GREEN=""; C_YELLOW=""
+    C_BLUE=""; C_MAGENTA=""; C_CYAN=""; C_GREY=""
+fi
 
-# ─── Helpers ─────────────────────────────────────────────────
-err()  { echo -e "${RED}[✗] $*${NC}" >&2; }
-ok()   { echo -e "${GREEN}[✓] $*${NC}"; }
-info() { echo -e "${CYAN}[i] $*${NC}"; }
-warn() { echo -e "${YELLOW}[!] $*${NC}"; }
-step() { echo -e "${BLUE}[→] $*${NC}"; }
-bold() { echo -e "${BOLD}$*${NC}"; }
+# ----------------------------------------------------------------------------
+#  Utility helpers
+# ----------------------------------------------------------------------------
+log_info()  { printf '%s[i]%s %s\n' "$C_CYAN"   "$C_RESET" "$*"; }
+log_ok()    { printf '%s[+]%s %s\n' "$C_GREEN"  "$C_RESET" "$*"; }
+log_warn()  { printf '%s[!]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+log_err()   { printf '%s[x]%s %s\n' "$C_RED"    "$C_RESET" "$*" >&2; }
+log_step()  { printf '%s==>%s %s\n' "$C_BLUE"   "$C_BOLD"  "$*"; }
 
-pause() {
-    echo ""
-    read -rp "$(echo -e "${DIM}  Press Enter to continue...${NC}")" _
+die()       { log_err "$*"; exit 1; }
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        die "Please run this script as root (sudo bash $0)"
+    fi
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+clear_screen() {
+    if [[ -t 1 ]]; then
+        printf '\033[2J\033[H'
+    fi
+}
+
+press_enter() {
+    printf '\n%sPress ENTER to continue...%s' "$C_DIM" "$C_RESET"
+    read -r _
+}
+
+banner() {
+    cat <<EOF
+${C_CYAN}${C_BOLD}
+  ____             _                                  _    _
+ | __ )  __ _  ___| | _____  _ __ ___  __ _ _   _ _ __| | _(_)_ __
+ |  _ \ / _\` |/ __| |/ _ \\ \\/ / '__/ _ \\/ _\` | | | | '__| |/ / | '_ \\
+ | |_) | (_| | (__| |  __/ >  <| | |  __/ (_| | |_| | |  |   <| | | | |
+ |____/ \\__,_|\\___|_|\\___|/_/\\_\\_|  \\___|\\__,_|\\__,_|_|  |_|\\_\\_|_| |_|
+${C_RESET}${C_GREY}   Reverse-tunnel manager for ${GITHUB_REPO}   |   v${SCRIPT_VERSION}${C_RESET}
+EOF
+}
+
+# Pretty-print a horizontal line of width N (default terminal width - 0)
+hr() {
+    local char="${1:--}"
+    local cols
+    cols="$(tput cols 2>/dev/null || printf 70)"
+    printf '%*s\n' "$cols" "" | tr ' ' "$char"
 }
 
 confirm() {
     local prompt="${1:-Are you sure?}"
-    local answer
-    read -rp "$(echo -e "${YELLOW}  ${prompt} [y/N]: ${NC}")" answer
-    [[ "${answer,,}" == "y" ]]
-}
-
-require_root() {
-    if [[ $EUID -ne 0 ]]; then
-        err "This action requires root privileges."
-        err "Please run: sudo $0"
-        exit 1
-    fi
-}
-
-detect_arch() {
-    local arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64)  echo "amd64" ;;
-        aarch64) echo "arm64" ;;
-        armv7l)  echo "armv7" ;;
-        i386|i686) echo "386" ;;
-        *)       echo "$arch" ;;
-    esac
-}
-
-detect_os() {
-    local os
-    os=$(uname -s | tr '[:upper:]' '[:lower:]')
-    echo "$os"
-}
-
-is_installed() {
-    [[ -x "${BINARY_PATH}" ]]
-}
-
-installed_version() {
-    if is_installed; then
-        "${BINARY_PATH}" --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown"
-    else
-        echo "not installed"
-    fi
-}
-
-list_tunnel_services() {
-    systemctl list-units --type=service --all --no-legend 2>/dev/null \
-        | awk '{print $1}' \
-        | grep "^${SERVICE_PREFIX}-" \
-        | sed 's/\.service$//' || true
-}
-
-list_config_files() {
-    find "${CONFIG_DIR}" -maxdepth 1 -name "*.toml" 2>/dev/null | sort || true
-}
-
-service_name_from_config() {
-    local config="$1"
-    local base
-    base=$(basename "$config" .toml)
-    echo "${SERVICE_PREFIX}-${base}"
-}
-
-config_from_service() {
-    local svc="$1"
-    local base="${svc#${SERVICE_PREFIX}-}"
-    echo "${CONFIG_DIR}/${base}.toml"
-}
-
-service_status_icon() {
-    local svc="$1"
-    if systemctl is-active --quiet "${svc}.service" 2>/dev/null; then
-        echo -e "${GREEN}●${NC}"
-    elif systemctl is-enabled --quiet "${svc}.service" 2>/dev/null; then
-        echo -e "${YELLOW}○${NC}"
-    else
-        echo -e "${RED}✗${NC}"
-    fi
-}
-
-service_status_text() {
-    local svc="$1"
-    if systemctl is-active --quiet "${svc}.service" 2>/dev/null; then
-        echo -e "${GREEN}running${NC}"
-    elif systemctl is-enabled --quiet "${svc}.service" 2>/dev/null; then
-        echo -e "${YELLOW}stopped${NC}"
-    else
-        echo -e "${RED}disabled${NC}"
-    fi
-}
-
-get_tunnel_role() {
-    local config="$1"
-    if grep -q '^\[server\]' "$config" 2>/dev/null; then
-        echo "server"
-    elif grep -q '^\[client\]' "$config" 2>/dev/null; then
-        echo "client"
-    else
-        echo "unknown"
-    fi
-}
-
-get_tunnel_transport() {
-    local config="$1"
-    grep -oP '(?<=^transport = ").*(?=")' "$config" 2>/dev/null || echo "?"
-}
-
-get_tunnel_bind_or_remote() {
-    local config="$1"
-    local role
-    role=$(get_tunnel_role "$config")
-    if [[ "$role" == "server" ]]; then
-        grep -oP '(?<=^bind_addr = ").*(?=")' "$config" 2>/dev/null || echo "?"
-    else
-        grep -oP '(?<=^remote_addr = ").*(?=")' "$config" 2>/dev/null || echo "?"
-    fi
-}
-
-draw_header() {
-    clear
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${WHITE}${BOLD}        Backhaul Reverse Tunnel Manager v2.0              ${NC}${CYAN}║${NC}"
-    echo -e "${CYAN}║${DIM}        github.com/Musixal/Backhaul                        ${NC}${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════╣${NC}"
-
-    local ver
-    ver=$(installed_version)
-    local status_str
-    if is_installed; then
-        status_str="${GREEN}Installed${NC} (${ver})"
-    else
-        status_str="${RED}Not Installed${NC}"
-    fi
-
-    local tunnel_count
-    tunnel_count=$(list_tunnel_services | wc -l)
-
-    printf "${CYAN}║${NC}  Binary : %-47b${CYAN}║${NC}\n" "$status_str"
-    printf "${CYAN}║${NC}  Tunnels: ${WHITE}%d${NC} configured%-37s${CYAN}║${NC}\n" "$tunnel_count" ""
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-}
-
-# ─── Installation ────────────────────────────────────────────
-install_backhaul() {
-    require_root
-    draw_header
-    bold "  ╔═ Install / Update Backhaul ═══════════════════════════╗"
-
-    echo ""
-    info "Detecting system architecture..."
-    local arch os
-    arch=$(detect_arch)
-    os=$(detect_os)
-    info "Detected: ${os}/${arch}"
-    echo ""
-
-    # Fetch latest release info
-    step "Fetching latest release from GitHub..."
-    local release_info download_url version
-    release_info=$(curl -fsSL --retry 3 "$GITHUB_API" 2>/dev/null) || {
-        warn "Could not reach GitHub API. Attempting manual version entry."
-        release_info=""
-    }
-
-    if [[ -n "$release_info" ]]; then
-        version=$(echo "$release_info" | grep '"tag_name"' | head -1 | grep -oP '(?<=")[^"]*(?=")' | tail -1)
-        download_url=$(echo "$release_info" | grep '"browser_download_url"' | grep "${os}_${arch}" | head -1 | grep -oP '(?<=")[^"]+\.tar\.gz(?=")')
-    fi
-
-    if [[ -z "${version:-}" ]]; then
-        echo ""
-        read -rp "$(echo -e "${YELLOW}  Enter version tag (e.g. v0.7.2): ${NC}")" version
-        version="${version#v}"
-        download_url="https://github.com/Musixal/Backhaul/releases/download/v${version}/backhaul_${os}_${arch}.tar.gz"
-    fi
-
-    if [[ -z "${download_url:-}" ]]; then
-        local ver_clean="${version#v}"
-        download_url="https://github.com/Musixal/Backhaul/releases/download/v${ver_clean}/backhaul_${os}_${arch}.tar.gz"
-    fi
-
-    info "Version  : ${version}"
-    info "Download : ${download_url}"
-    echo ""
-
-    if is_installed && ! confirm "Backhaul is already installed. Overwrite?"; then
-        return
-    fi
-
-    # Create dirs
-    mkdir -p "${CONFIG_DIR}" "${LOG_DIR}"
-
-    # Download
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    trap "rm -rf ${tmpdir}" EXIT
-
-    step "Downloading binary..."
-    if ! curl -fsSL --retry 3 -o "${tmpdir}/backhaul.tar.gz" "${download_url}"; then
-        err "Download failed. Check the URL or your internet connection."
-        info "Releases: ${GITHUB_RELEASES}"
-        pause; return 1
-    fi
-
-    step "Extracting archive..."
-    tar -xzf "${tmpdir}/backhaul.tar.gz" -C "${tmpdir}"
-
-    local extracted_bin
-    extracted_bin=$(find "${tmpdir}" -name "backhaul" -type f | head -1)
-    if [[ -z "$extracted_bin" ]]; then
-        err "Binary not found in archive."
-        pause; return 1
-    fi
-
-    chmod +x "$extracted_bin"
-    cp "$extracted_bin" "${BINARY_PATH}"
-
-    trap - EXIT
-    rm -rf "${tmpdir}"
-
-    ok "Backhaul installed at ${BINARY_PATH}"
-    ok "Version: $(installed_version)"
-    pause
-}
-
-uninstall_backhaul() {
-    require_root
-    draw_header
-    bold "  ╔═ Uninstall Backhaul ═══════════════════════════════════╗"
-    echo ""
-
-    if ! is_installed; then
-        warn "Backhaul binary is not installed."
-        pause; return
-    fi
-
-    local services
-    services=$(list_tunnel_services)
-    if [[ -n "$services" ]]; then
-        warn "The following tunnel services will also be removed:"
-        while IFS= read -r svc; do
-            echo -e "  ${RED}▸${NC} ${svc}"
-        done <<< "$services"
-        echo ""
-    fi
-
-    if ! confirm "Uninstall Backhaul and remove ALL services & configs?"; then
-        return
-    fi
-
-    # Stop and remove all services
-    while IFS= read -r svc; do
-        [[ -z "$svc" ]] && continue
-        step "Removing service: ${svc}"
-        systemctl stop "${svc}.service" 2>/dev/null || true
-        systemctl disable "${svc}.service" 2>/dev/null || true
-        rm -f "/etc/systemd/system/${svc}.service"
-    done <<< "$(list_tunnel_services)"
-
-    systemctl daemon-reload 2>/dev/null || true
-
-    rm -f "${BINARY_PATH}"
-    ok "Binary removed."
-
-    if confirm "Also remove all config files in ${CONFIG_DIR}?"; then
-        rm -rf "${CONFIG_DIR}"
-        ok "Config directory removed."
-    fi
-
-    if confirm "Also remove log directory ${LOG_DIR}?"; then
-        rm -rf "${LOG_DIR}"
-        ok "Log directory removed."
-    fi
-
-    ok "Backhaul uninstalled."
-    pause
-}
-
-# ─── Tunnel Creation ─────────────────────────────────────────
-pick_transport() {
-    echo "" >&2
-    echo -e "  ${BOLD}Select Transport Protocol:${NC}" >&2
-    echo "" >&2
-    echo -e "  ${CYAN}1)${NC} tcp      - Standard TCP (fastest, simple)" >&2
-    echo -e "  ${CYAN}2)${NC} tcpmux   - TCP with multiplexing (efficient, multi-session)" >&2
-    echo -e "  ${CYAN}3)${NC} udp      - UDP tunneling" >&2
-    echo -e "  ${CYAN}4)${NC} ws       - WebSocket (bypasses HTTP proxies/firewalls)" >&2
-    echo -e "  ${CYAN}5)${NC} wss      - Secure WebSocket with TLS" >&2
-    echo -e "  ${CYAN}6)${NC} wsmux    - WebSocket with multiplexing" >&2
-    echo -e "  ${CYAN}7)${NC} wssmux   - Secure WebSocket with TLS + multiplexing" >&2
-    echo "" >&2
-    local choice
-    read -rp "$(echo -e "${YELLOW}  Choice [1-7]: ${NC}")" choice
-    case "$choice" in
-        1) echo "tcp" ;;
-        2) echo "tcpmux" ;;
-        3) echo "udp" ;;
-        4) echo "ws" ;;
-        5) echo "wss" ;;
-        6) echo "wsmux" ;;
-        7) echo "wssmux" ;;
-        *) echo "tcp" ;;
-    esac
-}
-
-input_ports_interactive() {
-    echo ""
-    echo -e "  ${BOLD}Port Forwarding Rules:${NC}"
-    echo -e "  ${DIM}Formats supported:${NC}"
-    echo -e "  ${DIM}  443          → forward port 443 to remote 443${NC}"
-    echo -e "  ${DIM}  4000=5000    → local 4000 → remote 5000${NC}"
-    echo -e "  ${DIM}  443=1.1.1.1:5201 → local 443 → 1.1.1.1:5201${NC}"
-    echo -e "  ${DIM}  443-600      → port range 443 to 600${NC}"
-    echo ""
-    echo -e "  ${DIM}Enter ports one per line. Empty line when done.${NC}"
-    echo ""
-
-    local ports=()
-    local i=1
+    local reply
     while true; do
-        read -rp "$(echo -e "${YELLOW}  Port rule #${i} (or Enter to finish): ${NC}")" rule
-        [[ -z "$rule" ]] && break
-        ports+=("\"${rule}\"")
-        ((i++))
+        printf '%s%s [y/N]: %s' "$C_YELLOW" "$prompt" "$C_RESET"
+        read -r reply
+        case "$reply" in
+            [Yy]|[Yy][Ee][Ss]) return 0 ;;
+            [Nn]|[Nn][Oo]|"") return 1 ;;
+            *) printf 'Please answer y or n.\n' ;;
+        esac
     done
+}
 
-    if [[ ${#ports[@]} -eq 0 ]]; then
-        echo '[]'
+read_input() {
+    local prompt="$1"
+    local default="${2:-}"
+    local value
+    if [[ -n "$default" ]]; then
+        printf '%s%s [%s]: %s' "$C_BOLD" "$prompt" "$default" "$C_RESET"
     else
-        local joined
-        joined=$(IFS=', '; echo "${ports[*]}")
-        echo "[${joined}]"
+        printf '%s%s: %s' "$C_BOLD" "$prompt" "$C_RESET"
     fi
+    read -r value
+    printf '%s' "${value:-$default}"
 }
 
-generate_token() {
-    cat /proc/sys/kernel/random/uuid 2>/dev/null \
-        || openssl rand -hex 16 2>/dev/null \
-        || echo "$(date +%s%N | sha256sum | head -c 32)"
+read_input_required() {
+    local prompt="$1"
+    local value
+    while true; do
+        value="$(read_input "$prompt")"
+        [[ -n "$value" ]] && printf '%s' "$value" && return 0
+        log_warn "This field is required."
+    done
 }
 
-create_server_config() {
-    local name="$1"
-    local transport="$2"
-    local config_file="${CONFIG_DIR}/${name}.toml"
+read_int() {
+    local prompt="$1" default="$2" min="$3" max="$4"
+    local value
+    while true; do
+        value="$(read_input "$prompt" "$default")"
+        [[ -z "$value" ]] && value="$default"
+        if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= min && value <= max )); then
+            printf '%s' "$value"; return 0
+        fi
+        log_warn "Please enter a number between $min and $max."
+    done
+}
 
-    echo ""
-    echo -e "  ${BOLD}═══ Server Configuration ═══════════════════════════${NC}"
-    echo ""
+read_yesno_default_no() {
+    local prompt="$1" default="${2:-N}" value
+    while true; do
+        printf '%s%s [y/N]: %s' "$C_YELLOW" "$prompt" "$C_RESET"
+        read -r value
+        value="${value:-$default}"
+        case "$value" in
+            [Yy]|[Yy][Ee][Ss]) return 0 ;;
+            [Nn]|[Nn][Oo])     return 1 ;;
+            *) printf 'Please answer y or n.\n' ;;
+        esac
+    done
+}
 
-    # Bind address
-    local bind_addr
-    read -rp "$(echo -e "${YELLOW}  Bind address (default 0.0.0.0:3080): ${NC}")" bind_addr
-    bind_addr="${bind_addr:-0.0.0.0:3080}"
+# ----------------------------------------------------------------------------
+#  Environment setup / dependency installer
+# ----------------------------------------------------------------------------
+detect_arch() {
+    local m
+    m="$(uname -m)"
+    case "$m" in
+        x86_64|amd64)   printf 'amd64' ;;
+        aarch64|arm64)  printf 'arm64' ;;
+        armv7l|armv7)   printf 'armv7'  ;;
+        *) die "Unsupported architecture: $m  (only amd64 and arm64 are shipped in official releases)" ;;
+    esac
+}
 
-    # Token
-    local token
-    local auto_token
-    auto_token=$(generate_token)
-    read -rp "$(echo -e "${YELLOW}  Auth token [Enter for random: ${auto_token:0:8}...]: ${NC}")" token
-    token="${token:-$auto_token}"
-
-    # Advanced options?
-    local nodelay="false" channel_size="2048" heartbeat="40" keepalive="75"
-    local web_port="0" log_level="info"
-
-    if confirm "Configure advanced options?"; then
-        read -rp "$(echo -e "${YELLOW}  Enable nodelay? [y/N]: ${NC}")" nd
-        [[ "${nd,,}" == "y" ]] && nodelay="true"
-
-        read -rp "$(echo -e "${YELLOW}  Channel size [2048]: ${NC}")" cs
-        channel_size="${cs:-2048}"
-
-        read -rp "$(echo -e "${YELLOW}  Heartbeat interval in seconds [40]: ${NC}")" hb
-        heartbeat="${hb:-40}"
-
-        read -rp "$(echo -e "${YELLOW}  Keepalive period in seconds [75]: ${NC}")" kp
-        keepalive="${kp:-75}"
-
-        read -rp "$(echo -e "${YELLOW}  Web monitoring port (0=disabled) [0]: ${NC}")" wp
-        web_port="${wp:-0}"
-
-        echo -e "${YELLOW}  Log level [info/debug/warn/error]: ${NC}"
-        read -rp "  " ll
-        log_level="${ll:-info}"
-    fi
-
-    # TLS for wss/wssmux
-    local tls_cert="" tls_key=""
-    if [[ "$transport" == "wss" || "$transport" == "wssmux" ]]; then
-        echo ""
-        warn "TLS certificate and key are required for ${transport}."
-        echo -e "  ${DIM}Options:${NC}"
-        echo -e "  ${CYAN}1)${NC} Generate self-signed certificate"
-        echo -e "  ${CYAN}2)${NC} Provide existing paths"
-        read -rp "$(echo -e "${YELLOW}  Choice [1/2]: ${NC}")" tls_choice
-
-        if [[ "$tls_choice" == "1" ]]; then
-            tls_cert="${CONFIG_DIR}/${name}-server.crt"
-            tls_key="${CONFIG_DIR}/${name}-server.key"
-            step "Generating self-signed TLS certificate..."
-            openssl req -x509 -newkey rsa:2048 -keyout "${tls_key}" \
-                -out "${tls_cert}" -days 3650 -nodes \
-                -subj "/CN=backhaul-${name}" 2>/dev/null
-            ok "Certificate: ${tls_cert}"
-            ok "Key        : ${tls_key}"
+ensure_deps() {
+    log_step "Verifying required tools..."
+    local missing=()
+    for cmd in curl wget tar systemctl awk grep sed systemctl-journald openssl; do
+        if ! have "$cmd"; then missing+=("$cmd"); fi
+    done
+    if (( ${#missing[@]} > 0 )); then
+        log_warn "Missing tools: ${missing[*]}"
+        if have apt-get; then
+            log_step "Installing missing tools via apt..."
+            apt-get update -y >/dev/null
+            apt-get install -y curl wget tar openssl systemd-journald ca-certificates >/dev/null
+        elif have dnf; then
+            dnf install -y curl wget tar openssl systemd-journald ca-certificates >/dev/null
+        elif have yum; then
+            yum install -y curl wget tar openssl systemd-journald ca-certificates >/dev/null
         else
-            read -rp "$(echo -e "${YELLOW}  TLS cert path: ${NC}")" tls_cert
-            read -rp "$(echo -e "${YELLOW}  TLS key path:  ${NC}")" tls_key
+            die "Cannot auto-install missing tools. Please install: ${missing[*]}"
+        fi
+    fi
+    log_ok "All dependencies satisfied."
+}
+
+init_dirs() {
+    install -d -m 755 "$INSTALL_DIR"
+    install -d -m 755 "$CONF_DIR"
+    install -d -m 755 "$BACKUP_DIR"
+}
+
+# ----------------------------------------------------------------------------
+#  Binary download / update
+# ----------------------------------------------------------------------------
+fetch_latest_release_json() {
+    if have curl; then
+        curl -fsSL "$DEFAULT_API"
+    elif have wget; then
+        wget -qO- "$DEFAULT_API"
+    else
+        die "Neither curl nor wget is available."
+    fi
+}
+
+# Extracts a value for the given asset name from the release JSON
+# $1 = JSON, $2 = asset name
+extract_browser_url() {
+    local json="$1" name="$2"
+    printf '%s' "$json" \
+        | awk -v RS='},{' -v ORS='} {' -v n="$name" '
+            $0 ~ "\"name\":\""n"\"" {
+                match($0, /"browser_download_url":"[^"]+"/);
+                if (RSTART) {
+                    s = substr($0, RSTART, RLENGTH);
+                    gsub(/"browser_download_url":"|"$/, "", s);
+                    print s;
+                    exit
+                }
+            }
+        '
+}
+
+# $1 = JSON, $2 = asset name
+extract_asset_sha256() {
+    local json="$1" name="$2"
+    printf '%s' "$json" \
+        | awk -v RS='},{' -v ORS='} {' -v n="$name" '
+            $0 ~ "\"name\":\""n"\"" {
+                match($0, /"digest":"sha256:[a-f0-9]+"/);
+                if (RSTART) {
+                    s = substr($0, RSTART, RLENGTH);
+                    gsub(/"digest":"sha256:|"$/, "", s);
+                    print s;
+                    exit
+                }
+            }
+        '
+}
+
+download_backhaul_binary() {
+    local arch="$1"
+    local asset="backhaul_linux_${arch}.tar.gz"
+    local url="https://github.com/${GITHUB_REPO}/releases/download/__VERSION__/${asset}"
+    local tag version tmpdir
+
+    log_step "Fetching latest release metadata..."
+    local json
+    if ! json="$(fetch_latest_release_json 2>/dev/null)"; then
+        log_warn "Cannot reach GitHub API. Falling back to hardcoded v0.7.2"
+        tag="v0.7.2"
+    else
+        tag="$(printf '%s' "$json" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+        [[ -z "$tag" ]] && tag="v0.7.2"
+    fi
+    version="${tag#v}"
+    url="${url/__VERSION__/${tag}}"
+    log_info "Latest version: $tag"
+
+    tmpdir="$(mktemp -d)"
+    trap 'rm -rf "$tmpdir"' RETURN
+
+    log_step "Downloading $asset ..."
+    if have curl; then
+        curl -fL --retry 3 --connect-timeout 15 -o "$tmpdir/$asset" "$url" || die "Download failed: $url"
+    else
+        wget -O "$tmpdir/$asset" "$url" || die "Download failed: $url"
+    fi
+
+    # Verify SHA256 if checksum file is available
+    local checksum_url="https://github.com/${GITHUB_REPO}/releases/download/${tag}/checksums.txt"
+    if have curl && curl -fsSL -o "$tmpdir/checksums.txt" "$checksum_url" 2>/dev/null \
+       && [[ -s "$tmpdir/checksums.txt" ]]; then
+        local expected
+        expected="$(grep -i "$asset" "$tmpdir/checksums.txt" | awk '{print $1}' || true)"
+        if [[ -n "$expected" ]]; then
+            local actual
+            actual="$(sha256sum "$tmpdir/$asset" | awk '{print $1}')"
+            if [[ "${expected,,}" != "$actual" ]]; then
+                die "SHA256 mismatch for $asset. Aborting."
+            fi
+            log_ok "SHA256 verified."
         fi
     fi
 
-    # Ports
-    local ports_toml
-    ports_toml=$(input_ports_interactive)
+    log_step "Extracting binary..."
+    tar -xzf "$tmpdir/$asset" -C "$tmpdir"
+    local extracted
+    extracted="$(find "$tmpdir" -maxdepth 2 -type f -name 'backhaul' | head -1)"
+    [[ -z "$extracted" ]] && die "Could not locate extracted backhaul binary."
 
-    # Mux options
-    local mux_block=""
-    if [[ "$transport" == "tcpmux" || "$transport" == "wsmux" || "$transport" == "wssmux" ]]; then
-        echo ""
-        local mux_con="8"
-        read -rp "$(echo -e "${YELLOW}  Mux connections per stream [8]: ${NC}")" mc
-        mux_con="${mc:-8}"
-        mux_block="mux_con = ${mux_con}
-mux_version = 1
-mux_framesize = 32768
-mux_recievebuffer = 4194304
-mux_streambuffer = 65536"
-    fi
-
-    # Write config
-    {
-        echo "[server]"
-        echo "bind_addr = \"${bind_addr}\""
-        echo "transport = \"${transport}\""
-        echo "token = \"${token}\""
-        echo "keepalive_period = ${keepalive}"
-        echo "nodelay = ${nodelay}"
-        echo "channel_size = ${channel_size}"
-        echo "heartbeat = ${heartbeat}"
-        [[ -n "$mux_block" ]] && echo "$mux_block"
-        [[ -n "$tls_cert" ]] && echo "tls_cert = \"${tls_cert}\""
-        [[ -n "$tls_key"  ]] && echo "tls_key = \"${tls_key}\""
-        echo "web_port = ${web_port}"
-        echo "log_level = \"${log_level}\""
-        echo "sniffer = false"
-        echo "sniffer_log = \"${LOG_DIR}/${name}.json\""
-        echo "ports = ${ports_toml}"
-    } > "$config_file"
-
-    echo ""
-    ok "Server config saved: ${config_file}"
-    echo ""
-    info "Share these details with the client:"
-    echo -e "  ${CYAN}Remote addr : ${WHITE}${bind_addr}${NC}"
-    echo -e "  ${CYAN}Transport   : ${WHITE}${transport}${NC}"
-    echo -e "  ${CYAN}Token       : ${WHITE}${token}${NC}"
-
-    echo "$config_file"
+    install -m 755 "$extracted" "$BIN_PATH"
+    log_ok "Installed $BIN_PATH ($tag)"
+    "$BIN_PATH" --version 2>/dev/null || true
 }
 
-create_client_config() {
-    local name="$1"
-    local transport="$2"
-    local config_file="${CONFIG_DIR}/${name}.toml"
-
-    echo ""
-    echo -e "  ${BOLD}═══ Client Configuration ═══════════════════════════${NC}"
-    echo ""
-
-    # Remote address (the server's bind address)
-    local remote_addr
-    read -rp "$(echo -e "${YELLOW}  Server address:port (e.g. 1.2.3.4:3080): ${NC}")" remote_addr
-    while [[ -z "$remote_addr" ]]; do
-        warn "Remote address is required."
-        read -rp "$(echo -e "${YELLOW}  Server address:port: ${NC}")" remote_addr
-    done
-
-    # Token
-    local token
-    read -rp "$(echo -e "${YELLOW}  Auth token (must match server): ${NC}")" token
-    while [[ -z "$token" ]]; do
-        warn "Token is required."
-        read -rp "$(echo -e "${YELLOW}  Auth token: ${NC}")" token
-    done
-
-    # Advanced
-    local nodelay="false" pool="8" retry="3" keepalive="75"
-    local web_port="0" log_level="info" aggressive_pool="false"
-
-    if confirm "Configure advanced options?"; then
-        read -rp "$(echo -e "${YELLOW}  Enable nodelay? [y/N]: ${NC}")" nd
-        [[ "${nd,,}" == "y" ]] && nodelay="true"
-
-        read -rp "$(echo -e "${YELLOW}  Connection pool size [8]: ${NC}")" cp_size
-        pool="${cp_size:-8}"
-
-        read -rp "$(echo -e "${YELLOW}  Enable aggressive pool? [y/N]: ${NC}")" ap
-        [[ "${ap,,}" == "y" ]] && aggressive_pool="true"
-
-        read -rp "$(echo -e "${YELLOW}  Retry interval in seconds [3]: ${NC}")" ri
-        retry="${ri:-3}"
-
-        read -rp "$(echo -e "${YELLOW}  Keepalive period in seconds [75]: ${NC}")" kp
-        keepalive="${kp:-75}"
-
-        read -rp "$(echo -e "${YELLOW}  Web monitoring port (0=disabled) [0]: ${NC}")" wp
-        web_port="${wp:-0}"
-
-        read -rp "$(echo -e "${YELLOW}  Log level [info]: ${NC}")" ll
-        log_level="${ll:-info}"
+ensure_binary() {
+    if [[ -x "$BIN_PATH" ]]; then
+        log_info "Existing binary: $("$BIN_PATH" --version 2>&1 | head -1 || echo unknown)"
+        if confirm "Re-download / update Backhaul to the latest version?"; then
+            local arch; arch="$(detect_arch)"
+            download_backhaul_binary "$arch"
+        fi
+    else
+        local arch; arch="$(detect_arch)"
+        download_backhaul_binary "$arch"
     fi
-
-    # Edge IP (CDN/WebSocket)
-    local edge_ip=""
-    if [[ "$transport" == "ws" || "$transport" == "wss" || "$transport" == "wsmux" || "$transport" == "wssmux" ]]; then
-        read -rp "$(echo -e "${YELLOW}  Edge/CDN IP (optional, press Enter to skip): ${NC}")" edge_ip
-    fi
-
-    # Mux options
-    local mux_block=""
-    if [[ "$transport" == "tcpmux" || "$transport" == "wsmux" || "$transport" == "wssmux" ]]; then
-        mux_block="mux_version = 1
-mux_framesize = 32768
-mux_recievebuffer = 4194304
-mux_streambuffer = 65536"
-    fi
-
-    # Write config
-    {
-        echo "[client]"
-        echo "remote_addr = \"${remote_addr}\""
-        [[ -n "$edge_ip" ]] && echo "edge_ip = \"${edge_ip}\""
-        echo "transport = \"${transport}\""
-        echo "token = \"${token}\""
-        echo "connection_pool = ${pool}"
-        echo "aggressive_pool = ${aggressive_pool}"
-        echo "keepalive_period = ${keepalive}"
-        echo "nodelay = ${nodelay}"
-        echo "retry_interval = ${retry}"
-        echo "dial_timeout = 10"
-        [[ -n "$mux_block" ]] && echo "$mux_block"
-        echo "web_port = ${web_port}"
-        echo "log_level = \"${log_level}\""
-        echo "sniffer = false"
-        echo "sniffer_log = \"${LOG_DIR}/${name}.json\""
-    } > "$config_file"
-
-    echo ""
-    ok "Client config saved: ${config_file}"
-
-    echo "$config_file"
 }
 
-create_systemd_service() {
-    local name="$1"
-    local config_file="$2"
-    local svc_name="${SERVICE_PREFIX}-${name}"
-    local svc_file="/etc/systemd/system/${svc_name}.service"
+# ----------------------------------------------------------------------------
+#  Service / instance helpers
+# ----------------------------------------------------------------------------
+service_name() {
+    printf 'backhaul-%s' "$1"
+}
 
-    cat > "$svc_file" <<EOF
+service_path() {
+    printf '%s/%s.service' "$SVC_DIR" "$1"
+}
+
+conf_path() {
+    printf '%s/%s.toml' "$CONF_DIR" "$1"
+}
+
+# Build a sanitized instance name from a user-supplied label
+sanitize_instance_name() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+|-+$//g'
+}
+
+list_instances() {
+    local f
+    for f in "$CONF_DIR"/*.toml; do
+        [[ -f "$f" ]] || continue
+        basename "$f" .toml
+    done
+    # Also pick up service files that exist but have no config (orphan services)
+    local s
+    for s in "$SVC_DIR"/backhaul-*.service; do
+        [[ -f "$s" ]] || continue
+        basename "$s" .service
+    done | sort -u
+}
+
+instance_exists() {
+    [[ -f "$(conf_path "$1")" ]] || [[ -f "$(service_path "$1")" ]]
+}
+
+# ----------------------------------------------------------------------------
+#  systemd unit template
+# ----------------------------------------------------------------------------
+write_systemd_unit() {
+    local name="$1"
+    local svc; svc="$(service_path "$name")"
+    local cfg; cfg="$(conf_path "$name")"
+
+    cat > "$svc" <<EOF
 [Unit]
-Description=Backhaul Tunnel - ${name}
-Documentation=https://github.com/Musixal/Backhaul
-After=network.target network-online.target
+Description=Backhaul Reverse Tunnel - ${name}
+Documentation=https://github.com/${GITHUB_REPO}
+After=network-online.target nss-lookup.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${BINARY_PATH} -c ${config_file}
+User=root
+ExecStart=${BIN_PATH} -c ${cfg}
 Restart=always
-RestartSec=5
-StartLimitInterval=0
+RestartSec=3
 LimitNOFILE=1048576
-LimitNPROC=65536
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=${svc_name}
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=false
+KillMode=process
+TimeoutStopSec=20
+
+# Sandboxing (light)
+ProtectSystem=full
+ProtectHome=false
+PrivateTmp=false
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
     systemctl daemon-reload
-    ok "Service created: ${svc_file}"
-    echo "$svc_name"
 }
 
-create_tunnel() {
-    require_root
-    draw_header
-    bold "  ╔═ Create New Tunnel ════════════════════════════════════╗"
-    echo ""
+# ----------------------------------------------------------------------------
+#  TOML config writer
+# ----------------------------------------------------------------------------
+# $1=mode ("server"|"client") $2=instance_name $3=...
+# The full args list is parsed via globals / arrays passed to the function.
+write_toml_config() {
+    local mode="$1"; shift
+    local name="$1"; shift
+    local cfg; cfg="$(conf_path "$name")"
+    : > "$cfg"
 
-    if ! is_installed; then
-        err "Backhaul is not installed. Please install it first."
-        pause; return 1
-    fi
+    {
+        printf '# Backhaul %s config — instance: %s\n' "$mode" "$name"
+        printf '# Generated on %s by backhaul-manager.sh\n' "$(date '+%F %T')"
+        printf '# DO NOT edit this comment block manually if you want to keep it.\n\n'
 
-    mkdir -p "${CONFIG_DIR}" "${LOG_DIR}"
-
-    # Tunnel name
-    echo -e "  ${DIM}Tunnel name is used for the config file and service name.${NC}"
-    local name
-    read -rp "$(echo -e "${YELLOW}  Tunnel name (e.g. ir-tunnel): ${NC}")" name
-    name="${name//[^a-zA-Z0-9_-]/}"
-    while [[ -z "$name" ]]; do
-        warn "Name cannot be empty or contain special characters."
-        read -rp "$(echo -e "${YELLOW}  Tunnel name: ${NC}")" name
-        name="${name//[^a-zA-Z0-9_-]/}"
-    done
-
-    if [[ -f "${CONFIG_DIR}/${name}.toml" ]]; then
-        warn "A tunnel named '${name}' already exists."
-        if ! confirm "Overwrite it?"; then return; fi
-    fi
-
-    # Role
-    echo ""
-    echo -e "  ${BOLD}Select Role:${NC}"
-    echo ""
-    echo -e "  ${CYAN}1)${NC} Server  ${DIM}(Iran / restricted-side — waits for client connections)${NC}"
-    echo -e "  ${CYAN}2)${NC} Client  ${DIM}(Abroad / free-side — initiates the tunnel outbound)${NC}"
-    echo ""
-    read -rp "$(echo -e "${YELLOW}  Role [1/2]: ${NC}")" role_choice
-
-    local transport
-    transport=$(pick_transport)
-
-    local config_file
-    case "$role_choice" in
-        1) config_file=$(create_server_config "$name" "$transport") ;;
-        2) config_file=$(create_client_config "$name" "$transport") ;;
-        *)
-            err "Invalid choice."
-            pause; return 1
-            ;;
-    esac
-
-    echo ""
-    local svc_name
-    svc_name=$(create_systemd_service "$name" "$config_file")
-
-    # Enable & start?
-    echo ""
-    if confirm "Enable and start the tunnel service now?"; then
-        systemctl enable "${svc_name}.service" 2>/dev/null
-        systemctl start "${svc_name}.service"
-        sleep 1
-        if systemctl is-active --quiet "${svc_name}.service"; then
-            ok "Tunnel '${name}' is running!"
+        if [[ "$mode" == "server" ]]; then
+            printf '[server]\n'
+            printf 'bind_addr = "%s"\n'        "$BIND_ADDR"
+            printf 'transport = "%s"\n'        "$TRANSPORT"
+            printf 'token = "%s"\n'            "$TOKEN"
+            printf 'accept_udp = %s\n'         "$ACCEPT_UDP"
+            printf 'keepalive_period = %s\n'   "$KEEPALIVE_PERIOD"
+            printf 'nodelay = %s\n'            "$NODELAY"
+            printf 'channel_size = %s\n'       "$CHANNEL_SIZE"
+            printf 'heartbeat = %s\n'          "$HEARTBEAT"
+            printf 'sniffer = %s\n'            "$SNIFFER"
+            printf 'web_port = %s\n'           "$WEB_PORT"
+            printf 'log_level = "%s"\n'        "$LOG_LEVEL"
+            printf 'skip_optz = %s\n'          "$SKIP_OPTZ"
+            if [[ "$TRANSPORT" == "tcpmux" || "$TRANSPORT" == "wsmux" || "$TRANSPORT" == "wssmux" ]]; then
+                printf 'mux_con = %s\n'             "$MUX_CON"
+                printf 'mux_version = %s\n'         "$MUX_VERSION"
+                printf 'mux_framesize = %s\n'       "$MUX_FRAMESIZE"
+                printf 'mux_recievebuffer = %s\n'   "$MUX_RECVBUF"
+                printf 'mux_streambuffer = %s\n'    "$MUX_STRBUF"
+            fi
+            if [[ "$TRANSPORT" == "tcp" || "$TRANSPORT" == "tcpmux" ]]; then
+                printf 'mss = %s\n'           "$MSS"
+                printf 'so_rcvbuf = %s\n'     "$SO_RCVBUF"
+                printf 'so_sndbuf = %s\n'     "$SO_SNDBUF"
+            fi
+            if [[ "$TRANSPORT" == "wss" || "$TRANSPORT" == "wssmux" ]]; then
+                printf 'tls_cert = "%s"\n'    "$TLS_CERT"
+                printf 'tls_key  = "%s"\n'    "$TLS_KEY"
+            fi
+            printf '\nports = [\n'
+            local IFS=','
+            local first=1
+            for p in $PORTS; do
+                [[ -z "$p" ]] && continue
+                if (( first )); then first=0; else printf ',\n'; fi
+                printf '  "%s"' "$p"
+            done
+            printf '\n]\n'
         else
-            warn "Service started but may have issues. Check logs:"
-            echo -e "  ${CYAN}journalctl -u ${svc_name}.service -f${NC}"
+            printf '[client]\n'
+            printf 'remote_addr = "%s"\n'      "$REMOTE_ADDR"
+            printf 'transport = "%s"\n'        "$TRANSPORT"
+            printf 'token = "%s"\n'            "$TOKEN"
+            printf 'edge_ip = "%s"\n'          "$EDGE_IP"
+            printf 'connection_pool = %s\n'    "$CONNECTION_POOL"
+            printf 'aggressive_pool = %s\n'    "$AGGRESSIVE_POOL"
+            printf 'keepalive_period = %s\n'   "$KEEPALIVE_PERIOD"
+            printf 'nodelay = %s\n'            "$NODELAY"
+            printf 'retry_interval = %s\n'     "$RETRY_INTERVAL"
+            printf 'dial_timeout = %s\n'       "$DIAL_TIMEOUT"
+            printf 'sniffer = %s\n'            "$SNIFFER"
+            printf 'web_port = %s\n'           "$WEB_PORT"
+            printf 'log_level = "%s"\n'        "$LOG_LEVEL"
+            printf 'skip_optz = %s\n'          "$SKIP_OPTZ"
+            if [[ "$TRANSPORT" == "tcpmux" || "$TRANSPORT" == "wsmux" || "$TRANSPORT" == "wssmux" ]]; then
+                printf 'mux_version = %s\n'         "$MUX_VERSION"
+                printf 'mux_framesize = %s\n'       "$MUX_FRAMESIZE"
+                printf 'mux_recievebuffer = %s\n'   "$MUX_RECVBUF"
+                printf 'mux_streambuffer = %s\n'    "$MUX_STRBUF"
+            fi
+            if [[ "$TRANSPORT" == "tcp" || "$TRANSPORT" == "tcpmux" ]]; then
+                printf 'mss = %s\n'           "$MSS"
+                printf 'so_rcvbuf = %s\n'     "$SO_RCVBUF"
+                printf 'so_sndbuf = %s\n'     "$SO_SNDBUF"
+            fi
         fi
-    else
-        info "To start later: ${CYAN}systemctl start ${svc_name}.service${NC}"
-    fi
+    } >> "$cfg"
 
-    pause
+    chown root:root "$cfg" 2>/dev/null || true
+    chmod 600 "$cfg"
 }
 
-# ─── Service Management ───────────────────────────────────────
-select_tunnel() {
-    local prompt="${1:-Select a tunnel:}"
-    local services
-    services=$(list_tunnel_services)
-
-    if [[ -z "$services" ]]; then
-        warn "No tunnels found."
-        return 1
-    fi
-
-    echo ""
-    echo -e "  ${BOLD}${prompt}${NC}"
-    echo ""
-
-    local i=1
-    local -a svc_array=()
-    while IFS= read -r svc; do
-        [[ -z "$svc" ]] && continue
-        local icon status config role transport addr
-        icon=$(service_status_icon "$svc")
-        status=$(service_status_text "$svc")
-        config=$(config_from_service "$svc")
-        role=$(get_tunnel_role "$config")
-        transport=$(get_tunnel_transport "$config")
-        addr=$(get_tunnel_bind_or_remote "$config")
-
-        printf "  ${CYAN}%d)${NC} %b %-25s %b  ${DIM}[%s/%s → %s]${NC}\n" \
-            "$i" "$icon" "${svc#${SERVICE_PREFIX}-}" "$status" "$role" "$transport" "$addr"
-        svc_array+=("$svc")
-        ((i++))
-    done <<< "$services"
-
-    echo ""
-    read -rp "$(echo -e "${YELLOW}  Choice [1-$((i-1))]: ${NC}")" idx
-    idx="${idx:-0}"
-
-    if [[ "$idx" -lt 1 || "$idx" -ge "$i" ]]; then
-        err "Invalid selection."
-        return 1
-    fi
-
-    echo "${svc_array[$((idx-1))]}"
-}
-
-manage_services() {
+# ----------------------------------------------------------------------------
+#  Input wizards
+# ----------------------------------------------------------------------------
+# Choose mode (server/client)
+choose_mode() {
+    printf '\n%sSelect tunnel mode:%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %s1)%s %sServer%s  — runs on the public-facing side (e.g. abroad)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+    printf '  %s2)%s %sClient%s  — runs on the local/private side  (e.g. Iran)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
     while true; do
-        draw_header
-        bold "  ╔═ Service Management ═══════════════════════════════════╗"
-        echo ""
-
-        local services
-        services=$(list_tunnel_services)
-
-        if [[ -z "$services" ]]; then
-            warn "  No tunnel services configured yet."
-            echo ""
-            echo -e "  Go to ${CYAN}Create New Tunnel${NC} to get started."
-            pause; return
-        fi
-
-        echo -e "  ${BOLD}Configured Tunnels:${NC}"
-        echo ""
-
-        local i=1
-        local -a svc_array=()
-        while IFS= read -r svc; do
-            [[ -z "$svc" ]] && continue
-            local icon status config role transport addr
-            icon=$(service_status_icon "$svc")
-            status=$(service_status_text "$svc")
-            config=$(config_from_service "$svc")
-            role=$(get_tunnel_role "$config")
-            transport=$(get_tunnel_transport "$config")
-            addr=$(get_tunnel_bind_or_remote "$config")
-
-            printf "  %b ${BOLD}%d)${NC} %-25s  %b  ${DIM}%s/%s  %s${NC}\n" \
-                "$icon" "$i" "${svc#${SERVICE_PREFIX}-}" "$status" "$role" "$transport" "$addr"
-            svc_array+=("$svc")
-            ((i++))
-        done <<< "$services"
-
-        echo ""
-        echo -e "  ${BOLD}Actions:${NC}"
-        echo -e "  ${CYAN}s)${NC} Start    ${CYAN}p)${NC} Stop     ${CYAN}r)${NC} Restart"
-        echo -e "  ${CYAN}e)${NC} Enable   ${CYAN}d)${NC} Disable  ${CYAN}l)${NC} View Logs"
-        echo -e "  ${CYAN}i)${NC} Status   ${CYAN}v)${NC} View Config"
-        echo -e "  ${CYAN}x)${NC} Delete Tunnel   ${CYAN}b)${NC} Back"
-        echo ""
-        read -rp "$(echo -e "${YELLOW}  Action: ${NC}")" action
-
-        case "${action,,}" in
-            b|"") return ;;
-            s)
-                local svc
-                svc=$(select_tunnel "Select tunnel to start:") || { pause; continue; }
-                require_root
-                systemctl start "${svc}.service" && ok "Started: ${svc}" || err "Failed to start."
-                pause
-                ;;
-            p)
-                local svc
-                svc=$(select_tunnel "Select tunnel to stop:") || { pause; continue; }
-                require_root
-                systemctl stop "${svc}.service" && ok "Stopped: ${svc}" || err "Failed to stop."
-                pause
-                ;;
-            r)
-                local svc
-                svc=$(select_tunnel "Select tunnel to restart:") || { pause; continue; }
-                require_root
-                systemctl restart "${svc}.service" && ok "Restarted: ${svc}" || err "Failed to restart."
-                pause
-                ;;
-            e)
-                local svc
-                svc=$(select_tunnel "Select tunnel to enable:") || { pause; continue; }
-                require_root
-                systemctl enable "${svc}.service" && ok "Enabled: ${svc}" || err "Failed to enable."
-                pause
-                ;;
-            d)
-                local svc
-                svc=$(select_tunnel "Select tunnel to disable:") || { pause; continue; }
-                require_root
-                systemctl disable "${svc}.service" && ok "Disabled: ${svc}" || err "Failed to disable."
-                pause
-                ;;
-            l)
-                local svc
-                svc=$(select_tunnel "Select tunnel to view logs:") || { pause; continue; }
-                echo ""
-                info "Showing live logs for ${svc} (Ctrl+C to stop):"
-                echo ""
-                journalctl -u "${svc}.service" -f --no-pager -n 50 || true
-                pause
-                ;;
-            i)
-                local svc
-                svc=$(select_tunnel "Select tunnel for status:") || { pause; continue; }
-                echo ""
-                systemctl status "${svc}.service" --no-pager || true
-                pause
-                ;;
-            v)
-                local svc config
-                svc=$(select_tunnel "Select tunnel to view config:") || { pause; continue; }
-                config=$(config_from_service "$svc")
-                echo ""
-                if [[ -f "$config" ]]; then
-                    echo -e "${CYAN}━━━ ${config} ━━━${NC}"
-                    cat "$config"
-                    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-                else
-                    warn "Config file not found: ${config}"
-                fi
-                pause
-                ;;
-            x)
-                local svc
-                svc=$(select_tunnel "Select tunnel to DELETE:") || { pause; continue; }
-                require_root
-                echo ""
-                warn "This will stop, disable, and permanently remove the tunnel '${svc}'."
-                if confirm "Confirm deletion of '${svc}'?"; then
-                    systemctl stop "${svc}.service" 2>/dev/null || true
-                    systemctl disable "${svc}.service" 2>/dev/null || true
-                    rm -f "/etc/systemd/system/${svc}.service"
-                    systemctl daemon-reload
-
-                    local config
-                    config=$(config_from_service "$svc")
-                    if confirm "Also delete config file: ${config}?"; then
-                        rm -f "$config"
-                        ok "Config removed."
-                    fi
-                    ok "Tunnel '${svc}' deleted."
-                fi
-                pause
-                ;;
-            *)
-                warn "Unknown action."
-                pause
-                ;;
+        printf '%sChoice [1/2]: %s' "$C_BOLD" "$C_RESET"
+        read -r c
+        case "$c" in
+            1) MODE="server"; return 0 ;;
+            2) MODE="client"; return 0 ;;
+            *) printf 'Please enter 1 or 2.\n' ;;
         esac
     done
 }
 
-# ─── Diagnostics ─────────────────────────────────────────────
-run_diagnostics() {
-    draw_header
-    bold "  ╔═ System Diagnostics ═══════════════════════════════════╗"
-    echo ""
-
-    # Binary
-    echo -e "  ${BOLD}[ Binary ]${NC}"
-    if is_installed; then
-        ok "  Binary found   : ${BINARY_PATH}"
-        ok "  Version        : $(installed_version)"
-    else
-        err "  Binary NOT installed."
-    fi
-    echo ""
-
-    # systemd
-    echo -e "  ${BOLD}[ systemd ]${NC}"
-    if systemctl --version &>/dev/null; then
-        ok "  systemd available: $(systemctl --version | head -1)"
-    else
-        err "  systemd not found!"
-    fi
-    echo ""
-
-    # Services
-    echo -e "  ${BOLD}[ Tunnel Services ]${NC}"
-    local services
-    services=$(list_tunnel_services)
-    if [[ -z "$services" ]]; then
-        info "  No tunnel services configured."
-    else
-        while IFS= read -r svc; do
-            [[ -z "$svc" ]] && continue
-            local icon status
-            icon=$(service_status_icon "$svc")
-            status=$(service_status_text "$svc")
-            printf "  %b %-30s %b\n" "$icon" "$svc" "$status"
-        done <<< "$services"
-    fi
-    echo ""
-
-    # Network
-    echo -e "  ${BOLD}[ Network ]${NC}"
-    if command -v ss &>/dev/null; then
-        local listening
-        listening=$(ss -tlnp 2>/dev/null | grep backhaul || echo "  (none)")
-        info "  Backhaul listening sockets:"
-        echo "$listening" | sed 's/^/    /'
-    fi
-    echo ""
-
-    # Disk
-    echo -e "  ${BOLD}[ Disk Usage ]${NC}"
-    [[ -d "$CONFIG_DIR" ]] && info "  Config dir  : $(du -sh "${CONFIG_DIR}" 2>/dev/null | cut -f1)"
-    [[ -d "$LOG_DIR"    ]] && info "  Log dir     : $(du -sh "${LOG_DIR}" 2>/dev/null | cut -f1)"
-    echo ""
-
-    # Kernel
-    echo -e "  ${BOLD}[ System ]${NC}"
-    info "  Kernel  : $(uname -r)"
-    info "  OS      : $(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME}" || uname -s)"
-    info "  Arch    : $(uname -m) ($(detect_arch))"
-    info "  Uptime  : $(uptime -p 2>/dev/null || uptime)"
-
-    pause
+# Choose transport
+choose_transport() {
+    printf '\n%sSelect transport protocol:%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %s1)%s tcp       — plain TCP (lowest overhead)\n' "$C_CYAN" "$C_RESET"
+    printf '  %s2)%s tcpmux    — TCP + SMUX multiplexing\n' "$C_CYAN" "$C_RESET"
+    printf '  %s3)%s ws        — WebSocket (CDN-friendly)\n' "$C_CYAN" "$C_RESET"
+    printf '  %s4)%s wss       — secure WebSocket (TLS)\n' "$C_CYAN" "$C_RESET"
+    printf '  %s5)%s wsmux     — WS + SMUX multiplexing\n' "$C_CYAN" "$C_RESET"
+    printf '  %s6)%s wssmux    — WSS + SMUX multiplexing\n' "$C_CYAN" "$C_RESET"
+    printf '  %s7)%s udp       — UDP over TCP (server only)\n' "$C_CYAN" "$C_RESET"
+    while true; do
+        printf '%sChoice [1-7]: %s' "$C_BOLD" "$C_RESET"
+        read -r c
+        case "$c" in
+            1) TRANSPORT="tcp" ;;
+            2) TRANSPORT="tcpmux" ;;
+            3) TRANSPORT="ws" ;;
+            4) TRANSPORT="wss" ;;
+            5) TRANSPORT="wsmux" ;;
+            6) TRANSPORT="wssmux" ;;
+            7) TRANSPORT="udp" ;;
+            *) printf 'Please enter a number between 1 and 7.\n'; continue ;;
+        esac
+        return 0
+    done
 }
 
-# ─── Quick Log Viewer ─────────────────────────────────────────
-view_logs_menu() {
-    draw_header
-    bold "  ╔═ View Logs ════════════════════════════════════════════╗"
-    echo ""
-
-    local services
-    services=$(list_tunnel_services)
-
-    if [[ -z "$services" ]]; then
-        warn "No tunnel services found."
-        pause; return
+# Ask for ports — works for both server and client depending on MODE
+ask_ports() {
+    if [[ "$MODE" == "server" ]]; then
+        printf '\n%sPort forwarding rules (server side):%s\n' "$C_BOLD" "$C_RESET"
+        printf '  Format examples:\n'
+        printf '    443                    — listen 443, forward to same port on client\n'
+        printf '    443=5201               — listen 443, forward to 5201 on client\n'
+        printf '    443=1.1.1.1:5201       — listen 443, forward to 1.1.1.1:5201\n'
+        printf '    2000-2010              — listen on range 2000-2010, forward same range\n'
+        printf '    2000-2010=5201         — listen on range, all to port 5201\n'
+        printf '    2000-2010=1.1.1.1:5201 — listen on range, all to 1.1.1.1:5201\n'
+        printf '  You may enter multiple comma-separated rules. Empty = no forwarding.\n'
+        PORTS="$(read_input 'Ports' '')"
+    else
+        # clients do not expose ports — leave PORTS blank
+        PORTS=""
     fi
-
-    local svc
-    svc=$(select_tunnel "Select tunnel to view logs:") || { pause; return; }
-
-    echo ""
-    echo -e "  ${BOLD}Log Options:${NC}"
-    echo -e "  ${CYAN}1)${NC} Live tail (follow)"
-    echo -e "  ${CYAN}2)${NC} Last 100 lines"
-    echo -e "  ${CYAN}3)${NC} Last 500 lines"
-    echo -e "  ${CYAN}4)${NC} Since boot"
-    echo -e "  ${CYAN}5)${NC} Filter errors only"
-    echo ""
-    read -rp "$(echo -e "${YELLOW}  Choice [1-5]: ${NC}")" log_choice
-
-    echo ""
-    case "$log_choice" in
-        1) journalctl -u "${svc}.service" -f --no-pager ;;
-        2) journalctl -u "${svc}.service" -n 100 --no-pager ;;
-        3) journalctl -u "${svc}.service" -n 500 --no-pager ;;
-        4) journalctl -u "${svc}.service" -b --no-pager ;;
-        5) journalctl -u "${svc}.service" -p err --no-pager ;;
-        *) journalctl -u "${svc}.service" -n 50 --no-pager ;;
-    esac
-
-    pause
 }
 
-# ─── Quick Setup Wizard ───────────────────────────────────────
-quick_setup_wizard() {
-    require_root
-    draw_header
-    bold "  ╔═ Quick Setup Wizard ═══════════════════════════════════╗"
-    echo ""
-    echo -e "  ${DIM}This wizard sets up a common Iran↔Abroad tunnel in minutes.${NC}"
-    echo ""
+# Generate self-signed cert
+generate_self_signed_cert() {
+    local name="$1"
+    local certdir="/etc/backhaul/certs/${name}"
+    install -d -m 700 "$certdir"
+    local cn
+    cn="$(read_input 'Common Name (domain or IP, blank=auto)' "$(hostname -I 2>/dev/null | awk '{print $1}')")"
+    [[ -z "$cn" ]] && cn="backhaul"
 
-    if ! is_installed; then
-        warn "Backhaul is not installed."
-        if confirm "Install Backhaul now?"; then
-            install_backhaul
-            if ! is_installed; then
-                err "Installation failed. Cannot continue."
-                pause; return 1
-            fi
-        else
-            return
+    log_step "Generating RSA 2048-bit key..."
+    openssl genpkey -algorithm RSA -out "${certdir}/server.key" -pkeyopt rsa_keygen_bits:2048 2>/dev/null
+    chmod 600 "${certdir}/server.key"
+
+    log_step "Generating CSR..."
+    openssl req -new -key "${certdir}/server.key" \
+        -subj "/C=US/ST=NA/L=NA/O=Backhaul/OU=Tunnel/CN=${cn}" \
+        -out "${certdir}/server.csr" >/dev/null 2>&1
+
+    log_step "Generating self-signed certificate (valid 365 days)..."
+    openssl x509 -req -days 365 -in "${certdir}/server.csr" \
+        -signkey "${certdir}/server.key" \
+        -out "${certdir}/server.crt" >/dev/null 2>&1
+    chmod 644 "${certdir}/server.crt"
+    rm -f "${certdir}/server.csr"
+
+    TLS_CERT="${certdir}/server.crt"
+    TLS_KEY="${certdir}/server.key"
+    log_ok "TLS files created."
+}
+
+# ----------------------------------------------------------------------------
+#  Interactive config wizard
+# ----------------------------------------------------------------------------
+build_server_config() {
+    local name="$1"
+    printf '\n%s=== Server configuration: %s ===%s\n' "$C_BOLD" "$name" "$C_RESET"
+
+    BIND_ADDR="$(read_input 'Bind address (host:port)' '0.0.0.0:3080')"
+    if [[ ! "$BIND_ADDR" =~ ^[^:]+:[0-9]+$ ]]; then
+        log_warn "Bind address should look like 0.0.0.0:3080"
+    fi
+
+    choose_transport
+    TOKEN="$(read_input 'Token (any secret string)' "$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 24)")"
+    ACCEPT_UDP="false"
+    if [[ "$TRANSPORT" == "tcp" || "$TRANSPORT" == "tcpmux" ]]; then
+        if confirm "Enable accept_udp (encapsulate UDP over TCP)?"; then
+            ACCEPT_UDP="true"
         fi
     fi
 
-    echo -e "  ${BOLD}What is this machine?${NC}"
-    echo ""
-    echo -e "  ${CYAN}1)${NC} Iran Server     ${DIM}(restricted side — inside Iran, has panel/services)${NC}"
-    echo -e "  ${CYAN}2)${NC} Foreign Server  ${DIM}(free side — outside Iran, acts as tunnel client)${NC}"
-    echo ""
-    read -rp "$(echo -e "${YELLOW}  Choice [1/2]: ${NC}")" machine_type
+    KEEPALIVE_PERIOD="$(read_int 'keepalive_period (seconds)' 75 1 86400)"
+    NODELAY="true"; confirm 'Enable TCP_NODELAY (recommended)?' || NODELAY="false"
+    CHANNEL_SIZE="$(read_int 'channel_size' 2048 64 65536)"
+    HEARTBEAT="$(read_int 'heartbeat (seconds)' 40 1 86400)"
+    WEB_PORT="$(read_int 'web_port (0=disable)' 2060 0 65535)"
+    LOG_LEVEL="$(read_input 'log_level (info/debug/warn/error)' 'info')"
+    if confirm "Enable skip_optz (recommended on modern kernels)?"; then
+        SKIP_OPTZ="true"
+    else
+        SKIP_OPTZ="false"
+    fi
+    if confirm "Enable sniffer (records traffic)?"; then
+        SNIFFER="true"
+    else
+        SNIFFER="false"
+    fi
 
-    local name="main-tunnel"
-    read -rp "$(echo -e "${YELLOW}  Tunnel name [${name}]: ${NC}")" user_name
-    name="${user_name:-$name}"
-    name="${name//[^a-zA-Z0-9_-]/}"
+    if [[ "$TRANSPORT" == "tcpmux" || "$TRANSPORT" == "wsmux" || "$TRANSPORT" == "wssmux" ]]; then
+        MUX_CON="$(read_int 'mux_con' 8 1 4096)"
+        MUX_VERSION="$(read_int 'mux_version (1 or 2)' 1 1 2)"
+        MUX_FRAMESIZE="$(read_int 'mux_framesize' 32768 1024 16777216)"
+        MUX_RECVBUF="$(read_int 'mux_recievebuffer' 4194304 65536 268435456)"
+        MUX_STRBUF="$(read_int 'mux_streambuffer' 65536 4096 16777216)"
+    fi
 
-    case "$machine_type" in
-        1)
-            echo ""
-            info "Setting up IRAN SERVER (Backhaul server side)"
-            echo ""
-            echo -e "  ${BOLD}Recommended transports for Iran:${NC}"
-            echo -e "  ${CYAN}1)${NC} tcpmux  - Best performance + multiplexing"
-            echo -e "  ${CYAN}2)${NC} wsmux   - Good for bypassing DPI/firewalls"
-            echo -e "  ${CYAN}3)${NC} wssmux  - Encrypted WebSocket (most secure)"
-            echo -e "  ${CYAN}4)${NC} tcp     - Simple and stable"
-            read -rp "$(echo -e "${YELLOW}  Choice [1]: ${NC}")" t_choice
-            local transport
-            case "${t_choice:-1}" in
-                1) transport="tcpmux" ;;
-                2) transport="wsmux" ;;
-                3) transport="wssmux" ;;
-                4) transport="tcp" ;;
-                *) transport="tcpmux" ;;
-            esac
-            create_server_config "$name" "$transport" > /dev/null
-            local config_file="${CONFIG_DIR}/${name}.toml"
-            local svc_name
-            svc_name=$(create_systemd_service "$name" "$config_file")
-            echo ""
-            systemctl enable "${svc_name}.service"
-            systemctl start "${svc_name}.service"
-            sleep 1
-            if systemctl is-active --quiet "${svc_name}.service"; then
-                ok "Iran server tunnel is running!"
-            fi
-            ;;
-        2)
-            echo ""
-            info "Setting up FOREIGN CLIENT (Backhaul client side)"
-            echo ""
-            echo -e "  ${DIM}Enter the transport protocol — must match the Iran server.${NC}"
-            local transport
-            transport=$(pick_transport)
-            create_client_config "$name" "$transport" > /dev/null
-            local config_file="${CONFIG_DIR}/${name}.toml"
-            local svc_name
-            svc_name=$(create_systemd_service "$name" "$config_file")
-            echo ""
-            systemctl enable "${svc_name}.service"
-            systemctl start "${svc_name}.service"
-            sleep 1
-            if systemctl is-active --quiet "${svc_name}.service"; then
-                ok "Foreign client tunnel is running!"
-            fi
-            ;;
-        *)
-            err "Invalid choice."
-            pause; return 1
-            ;;
-    esac
+    if [[ "$TRANSPORT" == "tcp" || "$TRANSPORT" == "tcpmux" ]]; then
+        MSS="$(read_int 'mss (0=system default)' 1360 0 65535)"
+        SO_RCVBUF="$(read_int 'so_rcvbuf (0=default)' 4194304 0 268435456)"
+        SO_SNDBUF="$(read_int 'so_sndbuf (0=default)' 1048576 0 268435456)"
+    fi
 
-    echo ""
-    ok "Wizard complete! Run 'Manage Services' to check status."
-    pause
+    if [[ "$TRANSPORT" == "wss" || "$TRANSPORT" == "wssmux" ]]; then
+        if confirm "Generate a fresh self-signed TLS cert now?"; then
+            generate_self_signed_cert "$name"
+        else
+            TLS_CERT="$(read_input 'tls_cert path' "/etc/backhaul/certs/${name}/server.crt")"
+            TLS_KEY="$(read_input 'tls_key path'  "/etc/backhaul/certs/${name}/server.key")"
+        fi
+    fi
+
+    ask_ports
 }
 
-# ─── Main Menu ────────────────────────────────────────────────
+build_client_config() {
+    local name="$1"
+    printf '\n%s=== Client configuration: %s ===%s\n' "$C_BOLD" "$name" "$C_RESET"
+
+    REMOTE_ADDR="$(read_input 'Remote address (server host:port)' '1.2.3.4:3080')"
+    choose_transport
+    TOKEN="$(read_input 'Token (must match server)' '')"
+    [[ -z "$TOKEN" ]] && log_warn "Empty token — server must also have empty token."
+    EDGE_IP="$(read_input 'edge_ip (CDN only, blank=ignore)' '')"
+
+    CONNECTION_POOL="$(read_int 'connection_pool' 8 1 4096)"
+    AGGRESSIVE_POOL="false"
+    if confirm "Enable aggressive_pool (faster reconnect, higher CPU)?"; then
+        AGGRESSIVE_POOL="true"
+    fi
+    KEEPALIVE_PERIOD="$(read_int 'keepalive_period (seconds)' 75 1 86400)"
+    NODELAY="true"; confirm 'Enable TCP_NODELAY (recommended)?' || NODELAY="false"
+    RETRY_INTERVAL="$(read_int 'retry_interval (seconds)' 3 1 3600)"
+    DIAL_TIMEOUT="$(read_int 'dial_timeout (seconds)' 10 1 600)"
+    WEB_PORT="$(read_int 'web_port (0=disable)' 2060 0 65535)"
+    LOG_LEVEL="$(read_input 'log_level (info/debug/warn/error)' 'info')"
+    if confirm "Enable skip_optz (recommended on modern kernels)?"; then
+        SKIP_OPTZ="true"
+    else
+        SKIP_OPTZ="false"
+    fi
+    if confirm "Enable sniffer (records traffic)?"; then
+        SNIFFER="true"
+    else
+        SNIFFER="false"
+    fi
+
+    if [[ "$TRANSPORT" == "tcpmux" || "$TRANSPORT" == "wsmux" || "$TRANSPORT" == "wssmux" ]]; then
+        MUX_VERSION="$(read_int 'mux_version (1 or 2)' 1 1 2)"
+        MUX_FRAMESIZE="$(read_int 'mux_framesize' 32768 1024 16777216)"
+        MUX_RECVBUF="$(read_int 'mux_recievebuffer' 4194304 65536 268435456)"
+        MUX_STRBUF="$(read_int 'mux_streambuffer' 65536 4096 16777216)"
+    fi
+    if [[ "$TRANSPORT" == "tcp" || "$TRANSPORT" == "tcpmux" ]]; then
+        MSS="$(read_int 'mss (0=system default)' 1360 0 65535)"
+        SO_RCVBUF="$(read_int 'so_rcvbuf (0=default)' 1048576 0 268435456)"
+        SO_SNDBUF="$(read_int 'so_sndbuf (0=default)' 4194304 0 268435456)"
+    fi
+
+    PORTS=""
+}
+
+# ----------------------------------------------------------------------------
+#  Instance creation flow
+# ----------------------------------------------------------------------------
+create_instance() {
+    local name mode transport
+
+    printf '\n%s=== Create new tunnel ===%s\n' "$C_BOLD" "$C_RESET"
+    while true; do
+        local raw
+        raw="$(read_input 'Instance name (a-z, 0-9, . _ -)')"
+        name="$(sanitize_instance_name "$raw")"
+        if [[ -z "$name" ]]; then
+            log_warn "Invalid name."; continue
+        fi
+        if instance_exists "$name"; then
+            log_warn "An instance called '$name' already exists."
+            continue
+        fi
+        break
+    done
+
+    choose_mode
+    if [[ "$MODE" == "server" ]]; then
+        build_server_config "$name"
+    else
+        build_client_config "$name"
+    fi
+
+    write_toml_config "$MODE" "$name"
+    write_systemd_unit "$name"
+
+    log_ok "Instance '$name' created."
+    if confirm "Enable and start it now?"; then
+        systemctl enable "$(service_name "$name")" >/dev/null
+        systemctl start  "$(service_name "$name")"
+        sleep 1
+        systemctl --no-pager --no-legend status "$(service_name "$name")" || true
+    fi
+}
+
+# ----------------------------------------------------------------------------
+#  Instance listing & status
+# ----------------------------------------------------------------------------
+print_status_table() {
+    printf '\n%s%-22s %-7s %-8s %-9s %-9s %-22s%s\n' \
+        "$C_BOLD" "INSTANCE" "MODE" "TRANSPORT" "STATUS" "ENABLED" "LISTEN / REMOTE" "$C_RESET"
+    hr -
+
+    local name mode transport status enabled addr
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        local cfg; cfg="$(conf_path "$name")"
+        if [[ -f "$cfg" ]]; then
+            mode="$(grep -m1 -oE '\[(server|client)\]' "$cfg" | tr -d '[]')"
+            transport="$(grep -m1 '^transport' "$cfg" | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')"
+            if [[ "$mode" == "server" ]]; then
+                addr="$(grep -m1 '^bind_addr' "$cfg" | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')"
+            else
+                addr="$(grep -m1 '^remote_addr' "$cfg" | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')"
+            fi
+        else
+            mode="?"; transport="?"; addr="(no config)"
+        fi
+
+        local svc; svc="$(service_name "$name")"
+        if systemctl is-active --quiet "$svc"; then
+            status="${C_GREEN}active${C_RESET}"
+        elif systemctl is-failed --quiet "$svc" 2>/dev/null; then
+            status="${C_RED}failed${C_RESET}"
+        else
+            status="${C_YELLOW}inactive${C_RESET}"
+        fi
+
+        if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+            enabled="${C_GREEN}enabled${C_RESET}"
+        else
+            enabled="${C_GREY}disabled${C_RESET}"
+        fi
+
+        printf '%-22s %-7s %-8s %b %b %-22s\n' \
+            "$name" "${mode:-?}" "${transport:-?}" "$status" "$enabled" "${addr:-}"
+    done < <(list_instances)
+
+    if [[ -z "$(list_instances)" ]]; then
+        printf '%s(no instances yet — create one from the menu)%s\n' "$C_DIM" "$C_RESET"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+#  Pick an existing instance
+# ----------------------------------------------------------------------------
+pick_instance() {
+    local prompt="$1"
+    local instances
+    mapfile -t instances < <(list_instances)
+    if (( ${#instances[@]} == 0 )); then
+        log_warn "No instances configured yet."
+        return 1
+    fi
+    printf '\n%s%s%s\n' "$C_BOLD" "$prompt" "$C_RESET"
+    local i
+    for i in "${!instances[@]}"; do
+        printf '  %s%d)%s %s\n' "$C_CYAN" "$((i+1))" "$C_RESET" "${instances[$i]}"
+    done
+    printf '  %s0)%s Cancel\n' "$C_GREY" "$C_RESET"
+    local choice
+    while true; do
+        printf '%sChoice: %s' "$C_BOLD" "$C_RESET"
+        read -r choice
+        [[ "$choice" == "0" ]] && return 1
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#instances[@]} )); then
+            INSTANCE="${instances[$((choice-1))]}"
+            return 0
+        fi
+        printf 'Invalid choice.\n'
+    done
+}
+
+# ----------------------------------------------------------------------------
+#  Service operations
+# ----------------------------------------------------------------------------
+op_start()    { systemctl start    "$(service_name "$INSTANCE")"; log_ok "Started $INSTANCE"; }
+op_stop()     { systemctl stop     "$(service_name "$INSTANCE")"; log_ok "Stopped $INSTANCE"; }
+op_restart()  { systemctl restart  "$(service_name "$INSTANCE")"; log_ok "Restarted $INSTANCE"; }
+op_reload()   { systemctl reload   "$(service_name "$INSTANCE")" 2>/dev/null || op_restart; log_ok "Reloaded $INSTANCE"; }
+op_enable()   { systemctl enable   "$(service_name "$INSTANCE")"; log_ok "Enabled $INSTANCE"; }
+op_disable()  { systemctl disable  "$(service_name "$INSTANCE")"; log_ok "Disabled $INSTANCE"; }
+op_status()   { systemctl --no-pager --no-legend status "$(service_name "$INSTANCE")"; }
+
+op_logs() {
+    local lines; lines="$(read_input 'Lines to show (Enter = 200)' '200')"
+    lines="${lines:-200}"
+    journalctl -u "$(service_name "$INSTANCE")" -n "$lines" --no-pager
+    if confirm "Follow logs live (Ctrl+C to exit)?"; then
+        journalctl -u "$(service_name "$INSTANCE")" -f --no-pager
+    fi
+}
+
+op_show_config() {
+    if [[ ! -f "$(conf_path "$INSTANCE")" ]]; then
+        log_warn "No config file found for $INSTANCE."
+        return
+    fi
+    printf '\n%s--- %s ---%s\n' "$C_BOLD" "$(conf_path "$INSTANCE")" "$C_RESET"
+    cat "$(conf_path "$INSTANCE")"
+}
+
+op_edit_config() {
+    local cfg; cfg="$(conf_path "$INSTANCE")"
+    [[ -f "$cfg" ]] || { log_warn "No config file."; return; }
+    local editor="${EDITOR:-}"
+    if [[ -z "$editor" ]]; then
+        for e in nano vi vim; do
+            if have "$e"; then editor="$e"; break; fi
+        done
+    fi
+    if [[ -z "$editor" ]]; then
+        log_warn "No editor found. Please install 'nano' or set EDITOR."
+        return
+    fi
+    "$editor" "$cfg"
+    if confirm "Reload service to apply new config?"; then
+        op_reload
+    fi
+}
+
+op_remove() {
+    local svc; svc="$(service_name "$INSTANCE")"
+    local cfg; cfg="$(conf_path "$INSTANCE")"
+    if systemctl list-unit-files "$svc" >/dev/null 2>&1; then
+        systemctl stop    "$svc" 2>/dev/null || true
+        systemctl disable "$svc" 2>/dev/null || true
+    fi
+    rm -f "$(service_path "$INSTANCE")"
+    systemctl daemon-reload
+    if [[ -f "$cfg" ]]; then
+        if confirm "Also delete config file $cfg?"; then
+            # keep last backup
+            cp -a "$cfg" "$BACKUP_DIR/${INSTANCE}.$(date +%s).toml" 2>/dev/null || true
+            rm -f "$cfg"
+            log_ok "Removed service + config (backup in $BACKUP_DIR)."
+        else
+            log_ok "Removed service (config kept)."
+        fi
+    else
+        log_ok "Removed service."
+    fi
+}
+
+op_backup() {
+    local cfg; cfg="$(conf_path "$INSTANCE")"
+    [[ -f "$cfg" ]] || { log_warn "No config to back up."; return; }
+    local dest="$BACKUP_DIR/${INSTANCE}.$(date +%s).toml"
+    install -d "$BACKUP_DIR"
+    cp -a "$cfg" "$dest"
+    chmod 600 "$dest"
+    log_ok "Backed up to $dest"
+}
+
+op_clone() {
+    local src_name="$INSTANCE"
+    local dst_raw
+    dst_raw="$(read_input 'Name for cloned instance')"
+    local dst; dst="$(sanitize_instance_name "$dst_raw")"
+    [[ -z "$dst" ]] && { log_warn "Invalid name."; return; }
+    instance_exists "$dst" && { log_warn "'$dst' already exists."; return; }
+    local src_cfg; src_cfg="$(conf_path "$src_name")"
+    local dst_cfg; dst_cfg="$(conf_path "$dst")"
+    cp -a "$src_cfg" "$dst_cfg"
+    # rewrite the header comment
+    sed -i "1s|.*|# Backhaul config (cloned from ${src_name}) — instance: ${dst}|" "$dst_cfg" 2>/dev/null || true
+    write_systemd_unit "$dst"
+    log_ok "Cloned '$src_name' → '$dst'."
+}
+
+op_export() {
+    local cfg; cfg="$(conf_path "$INSTANCE")"
+    [[ -f "$cfg" ]] || { log_warn "No config."; return; }
+    local dest; dest="$(read_input 'Export path' "/tmp/${INSTANCE}.toml")"
+    cp -a "$cfg" "$dest"
+    log_ok "Exported to $dest"
+}
+
+op_import() {
+    local src; src="$(read_input 'Path to .toml file to import')"
+    [[ -f "$src" ]] || { log_warn "File not found."; return; }
+    local raw; raw="$(basename "$src" .toml)"
+    local name; name="$(sanitize_instance_name "$(read_input 'Instance name' "$raw")")"
+    instance_exists "$name" && { log_warn "'$name' already exists."; return; }
+    install -m 600 "$src" "$(conf_path "$name")"
+    # Try to detect mode from the file
+    if grep -q '\[server\]' "$(conf_path "$name")"; then MODE="server"; else MODE="client"; fi
+    write_systemd_unit "$name"
+    log_ok "Imported as '$name' ($MODE)."
+}
+
+# ----------------------------------------------------------------------------
+#  Bulk operations
+# ----------------------------------------------------------------------------
+bulk_start_all() {
+    local i
+    while IFS= read -r i; do
+        [[ -z "$i" ]] && continue
+        systemctl enable "$(service_name "$i")" 2>/dev/null || true
+        systemctl start  "$(service_name "$i")" 2>/dev/null || log_warn "Failed to start $i"
+    done < <(list_instances)
+    log_ok "All instances started."
+}
+bulk_stop_all() {
+    local i
+    while IFS= read -r i; do
+        [[ -z "$i" ]] && continue
+        systemctl stop "$(service_name "$i")" 2>/dev/null || log_warn "Failed to stop $i"
+    done < <(list_instances)
+    log_ok "All instances stopped."
+}
+bulk_restart_all() {
+    local i
+    while IFS= read -r i; do
+        [[ -z "$i" ]] && continue
+        systemctl restart "$(service_name "$i")" 2>/dev/null || log_warn "Failed to restart $i"
+    done < <(list_instances)
+    log_ok "All instances restarted."
+}
+
+# ----------------------------------------------------------------------------
+#  Uninstall whole manager / binary
+# ----------------------------------------------------------------------------
+uninstall_all() {
+    confirm "This will REMOVE all Backhaul services, configs and the binary. Continue?" || return
+    local i svc
+    while IFS= read -r i; do
+        [[ -z "$i" ]] && continue
+        svc="$(service_name "$i")"
+        systemctl stop    "$svc" 2>/dev/null || true
+        systemctl disable "$svc" 2>/dev/null || true
+        rm -f "$(service_path "$i")"
+    done < <(list_instances)
+    systemctl daemon-reload
+    rm -f "$BIN_PATH"
+    if confirm "Also remove ALL configs and backups ($CONF_DIR, $BACKUP_DIR)?"; then
+        rm -rf "$CONF_DIR" "$BACKUP_DIR"
+    fi
+    log_ok "Uninstall completed."
+}
+
+# ----------------------------------------------------------------------------
+#  Menus
+# ----------------------------------------------------------------------------
+instance_menu() {
+    pick_instance "Select instance" || return
+    while true; do
+        clear_screen; banner
+        printf '\n%sManaging instance:%s %s%s%s\n\n' "$C_BOLD" "$C_RESET" "$C_CYAN" "$INSTANCE" "$C_RESET"
+        printf '  %s1)%s Start\n'            "$C_CYAN" "$C_RESET"
+        printf '  %s2)%s Stop\n'             "$C_CYAN" "$C_RESET"
+        printf '  %s3)%s Restart\n'          "$C_CYAN" "$C_RESET"
+        printf '  %s4)%s Reload (SIGHUP)\n'  "$C_CYAN" "$C_RESET"
+        printf '  %s5)%s Enable at boot\n'   "$C_CYAN" "$C_RESET"
+        printf '  %s6)%s Disable at boot\n'  "$C_CYAN" "$C_RESET"
+        printf '  %s7)%s View status\n'      "$C_CYAN" "$C_RESET"
+        printf '  %s8)%s View logs\n'        "$C_CYAN" "$C_RESET"
+        printf '  %s9)%s Show config\n'      "$C_CYAN" "$C_RESET"
+        printf '  %s10)%s Edit config\n'     "$C_CYAN" "$C_RESET"
+        printf '  %s11)%s Backup config\n'   "$C_CYAN" "$C_RESET"
+        printf '  %s12)%s Clone to new name\n'"$C_CYAN" "$C_RESET"
+        printf '  %s13)%s Export config\n'   "$C_CYAN" "$C_RESET"
+        printf '  %s14)%s Remove\n'          "$C_CYAN" "$C_RESET"
+        printf '  %s0)%s Back to main menu\n' "$C_GREY" "$C_RESET"
+        local ch; printf '%sChoice: %s' "$C_BOLD" "$C_RESET"; read -r ch
+        case "$ch" in
+            1)  op_start   ; press_enter ;;
+            2)  op_stop    ; press_enter ;;
+            3)  op_restart ; press_enter ;;
+            4)  op_reload  ; press_enter ;;
+            5)  op_enable  ; press_enter ;;
+            6)  op_disable ; press_enter ;;
+            7)  op_status  ; press_enter ;;
+            8)  op_logs    ; press_enter ;;
+            9)  op_show_config ; press_enter ;;
+            10) op_edit_config ; press_enter ;;
+            11) op_backup  ; press_enter ;;
+            12) op_clone   ; press_enter ;;
+            13) op_export  ; press_enter ;;
+            14) op_remove  ; press_enter ;;
+            0) return 0 ;;
+            *) printf 'Invalid.\n' ;;
+        esac
+    done
+}
+
+import_menu() {
+    while true; do
+        clear_screen; banner
+        printf '\n%sImport / Export%s\n\n' "$C_BOLD" "$C_RESET"
+        printf '  %s1)%s Import a .toml config\n' "$C_CYAN" "$C_RESET"
+        printf '  %s0)%s Back\n'                  "$C_GREY" "$C_RESET"
+        local ch; printf '%sChoice: %s' "$C_BOLD" "$C_RESET"; read -r ch
+        case "$ch" in
+            1) op_import; press_enter ;;
+            0) return 0 ;;
+        esac
+    done
+}
+
 main_menu() {
     while true; do
-        draw_header
-        echo -e "  ${BOLD}Main Menu${NC}"
-        echo ""
-        echo -e "  ${CYAN}1)${NC}  Quick Setup Wizard    ${DIM}(recommended for first-time users)${NC}"
-        echo -e "  ${CYAN}2)${NC}  Create New Tunnel      ${DIM}(manual, full control)${NC}"
-        echo -e "  ${CYAN}3)${NC}  Manage Tunnel Services ${DIM}(start / stop / restart / logs)${NC}"
-        echo -e "  ${CYAN}4)${NC}  View Logs"
-        echo -e "  ${CYAN}5)${NC}  System Diagnostics"
-        echo ""
-        echo -e "  ${CYAN}6)${NC}  Install / Update Backhaul Binary"
-        echo -e "  ${CYAN}7)${NC}  Uninstall Backhaul"
-        echo ""
-        echo -e "  ${RED}0)${NC}  Exit"
-        echo ""
-        read -rp "$(echo -e "${YELLOW}  Choice: ${NC}")" choice
-
-        case "$choice" in
-            1) quick_setup_wizard ;;
-            2) create_tunnel ;;
-            3) manage_services ;;
-            4) view_logs_menu ;;
-            5) run_diagnostics ;;
-            6) install_backhaul ;;
-            7) uninstall_backhaul ;;
-            0|q|Q|exit|quit)
-                echo ""
-                ok "Goodbye!"
-                echo ""
-                exit 0
-                ;;
-            *) warn "Invalid option."; sleep 1 ;;
+        clear_screen; banner
+        print_status_table
+        printf '\n%sMain Menu%s\n\n' "$C_BOLD" "$C_RESET"
+        printf '  %s1)%s Create new tunnel (server/client)\n' "$C_CYAN" "$C_RESET"
+        printf '  %s2)%s Manage an existing instance\n'       "$C_CYAN" "$C_RESET"
+        printf '  %s3)%s Start ALL instances\n'                "$C_CYAN" "$C_RESET"
+        printf '  %s4)%s Stop  ALL instances\n'                "$C_CYAN" "$C_RESET"
+        printf '  %s5)%s Restart ALL instances\n'              "$C_CYAN" "$C_RESET"
+        printf '  %s6)%s Import / export configs\n'            "$C_CYAN" "$C_RESET"
+        printf '  %s7)%s Update / re-download Backhaul binary\n'"$C_CYAN" "$C_RESET"
+        printf '  %s8)%s Show paths & system info\n'           "$C_CYAN" "$C_RESET"
+        printf '  %s9)%s Uninstall Backhaul (full cleanup)\n'  "$C_CYAN" "$C_RESET"
+        printf '  %s0)%s Exit\n'                               "$C_GREY" "$C_RESET"
+        local ch; printf '%sChoice: %s' "$C_BOLD" "$C_RESET"; read -r ch
+        case "$ch" in
+            1) create_instance; press_enter ;;
+            2) instance_menu ;;
+            3) bulk_start_all; press_enter ;;
+            4) bulk_stop_all; press_enter ;;
+            5) bulk_restart_all; press_enter ;;
+            6) import_menu ;;
+            7) ensure_binary; press_enter ;;
+            8) show_info ;;
+            9) uninstall_all; press_enter ;;
+            0) printf '%sGoodbye!%s\n' "$C_CYAN" "$C_RESET"; exit 0 ;;
+            *) printf 'Invalid choice.\n' ;;
         esac
     done
 }
 
-# ─── Entry Point ─────────────────────────────────────────────
-main() {
-    # Check dependencies
-    local missing=()
-    for cmd in systemctl curl tar openssl; do
-        command -v "$cmd" &>/dev/null || missing+=("$cmd")
-    done
-
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        echo -e "${RED}[!] Missing required tools: ${missing[*]}${NC}"
-        echo -e "${YELLOW}    Install with: apt-get install -y ${missing[*]}${NC}"
-        exit 1
+show_info() {
+    clear_screen; banner
+    printf '\n%sSystem & installation info%s\n\n' "$C_BOLD" "$C_RESET"
+    printf '  Script version : %s\n'  "$SCRIPT_VERSION"
+    printf '  OS / kernel    : %s  (%s)\n' "$(uname -srm)" "$(uname -m)"
+    printf '  Architecture   : %s\n' "$(detect_arch 2>/dev/null || echo '?')"
+    printf '  systemd        : %s\n' "$(systemctl --version | head -1 || echo 'not available')"
+    printf '  Install dir    : %s\n' "$INSTALL_DIR"
+    printf '  Configs dir    : %s\n' "$CONF_DIR"
+    printf '  Services dir   : %s\n' "$SVC_DIR"
+    printf '  Binary path    : %s\n' "$BIN_PATH"
+    printf '  Backups dir    : %s\n' "$BACKUP_DIR"
+    if [[ -x "$BIN_PATH" ]]; then
+        printf '  Backhaul ver   : %s\n' "$("$BIN_PATH" --version 2>&1 | head -1 || echo 'unknown')"
+    else
+        printf '  Backhaul ver   : %snot installed%s\n' "$C_RED" "$C_RESET"
     fi
+    printf '  Instances      : %d\n' "$(list_instances | wc -l)"
+    press_enter
+}
 
-    # Handle CLI arguments for non-interactive use
-    case "${1:-}" in
-        install)   require_root; install_backhaul; exit 0 ;;
-        uninstall) require_root; uninstall_backhaul; exit 0 ;;
-        diag)      run_diagnostics; exit 0 ;;
-        *)         main_menu ;;
-    esac
+# ----------------------------------------------------------------------------
+#  Entrypoint
+# ----------------------------------------------------------------------------
+main() {
+    require_root
+    ensure_deps
+    init_dirs
+    ensure_binary
+    main_menu
 }
 
 main "$@"
