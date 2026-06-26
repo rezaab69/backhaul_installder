@@ -13,4 +13,7 @@ sudo ./backhaul-manager.sh install
 
 sudo ./backhaul-manager.sh diag
 
+
+# Or
+
 bash <(curl -Ls [https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh](https://raw.githubusercontent.com/rezaab69/backhaul_installder/refs/heads/main/backhaul-manager.sh))
